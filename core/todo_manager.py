@@ -17,6 +17,7 @@ class TodoItem:
     due_iso: Optional[str]
     notified: bool
     created_iso: str
+    order: int
 
     @property
     def due_datetime(self) -> Optional[datetime]:
@@ -56,8 +57,10 @@ class TodoManager:
             return
 
         self.items = []
-        for obj in raw:
+        for idx, obj in enumerate(raw):
             try:
+                order_val = obj.get("order")
+                order = int(order_val) if isinstance(order_val, int) else idx
                 item = TodoItem(
                     id=obj.get("id", str(uuid.uuid4())),
                     title=obj.get("title", ""),
@@ -68,6 +71,7 @@ class TodoManager:
                         "created_iso",
                         datetime.now().isoformat(timespec="seconds"),
                     ),
+                    order=order,
                 )
                 self.items.append(item)
             except Exception:
@@ -84,6 +88,7 @@ class TodoManager:
     # operations ----------------------------------------------------------
     def add(self, title: str, due: Optional[datetime]) -> TodoItem:
         now = datetime.now()
+        next_order = max((i.order for i in self.items), default=-1) + 1
         item = TodoItem(
             id=str(uuid.uuid4()),
             title=title,
@@ -91,6 +96,7 @@ class TodoManager:
             due_iso=due.isoformat(timespec="minutes") if due else None,
             notified=False,
             created_iso=now.isoformat(timespec="seconds"),
+            order=next_order,
         )
         self.items.append(item)
         self._save()
@@ -121,6 +127,26 @@ class TodoManager:
                 break
         self._save()
 
+    def reorder(self, item_id: str, new_index: int) -> None:
+        """Move item with item_id to new_index in items list."""
+        current_index = None
+        for idx, item in enumerate(self.items):
+            if item.id == item_id:
+                current_index = idx
+                break
+        if current_index is None or new_index < 0 or new_index >= len(self.items):
+            return
+        if current_index == new_index:
+            return
+
+        item = self.items.pop(current_index)
+        self.items.insert(new_index, item)
+
+        # re-normalise order values
+        for idx, it in enumerate(self.items):
+            it.order = idx
+        self._save()
+
     # queries -------------------------------------------------------------
     def get(self, item_id: str) -> Optional[TodoItem]:
         for item in self.items:
@@ -129,9 +155,6 @@ class TodoManager:
         return None
 
     def sorted_items(self) -> List[TodoItem]:
-        def key(i: TodoItem):
-            done = 1 if i.completed else 0
-            return (done, i.due_datetime or datetime.max, i.created_at)
-
-        return sorted(self.items, key=key)
+        """Return items in explicit order, newest structure first."""
+        return sorted(self.items, key=lambda i: i.order)
 

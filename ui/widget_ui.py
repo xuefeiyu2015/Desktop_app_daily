@@ -27,12 +27,15 @@ class TodoRow(ctk.CTkFrame):
         *,
         on_toggle,
         on_delete,
+        on_update,
         **kwargs,
     ) -> None:
         super().__init__(master, fg_color="transparent", **kwargs)
         self.item = item
         self.on_toggle = on_toggle
         self.on_delete = on_delete
+        self.on_update = on_update
+        self._editing = False
         self._build()
 
     def _build(self) -> None:
@@ -75,6 +78,7 @@ class TodoRow(ctk.CTkFrame):
         # text
         text_frame = ctk.CTkFrame(inner, fg_color="transparent")
         text_frame.pack(side="left", fill="both", expand=True)
+        self._text_frame = text_frame
 
         name_font = ctk.CTkFont(
             family=FONT_FAMILY,
@@ -90,6 +94,7 @@ class TodoRow(ctk.CTkFrame):
             anchor="w",
         )
         name.pack(fill="x")
+        name.bind("<Double-Button-1>", lambda e: self._enter_edit_mode())
 
         # meta row (due time)
         if self.item.due_datetime:
@@ -101,6 +106,9 @@ class TodoRow(ctk.CTkFrame):
                 anchor="w",
             )
             due.pack(fill="x", pady=(2, 0))
+            self._due_label = due
+        else:
+            self._due_label = None
 
         # delete button
         delete = ctk.CTkButton(
@@ -116,6 +124,63 @@ class TodoRow(ctk.CTkFrame):
             command=lambda: self.on_delete(self.item.id),
         )
         delete.pack(side="right")
+
+        # edit on double click anywhere on the row
+        card.bind("<Double-Button-1>", lambda e: self._enter_edit_mode())
+        inner.bind("<Double-Button-1>", lambda e: self._enter_edit_mode())
+
+    def _enter_edit_mode(self) -> None:
+        if self._editing:
+            return
+        self._editing = True
+
+        for child in self._text_frame.winfo_children():
+            child.destroy()
+
+        title_entry = ctk.CTkEntry(
+            self._text_frame,
+            height=28,
+            corner_radius=10,
+            fg_color="#202025",
+            border_color="#2E2E36",
+            text_color=TEXT_PRIMARY,
+        )
+        title_entry.pack(fill="x")
+        title_entry.insert(0, self.item.title)
+
+        time_entry = ctk.CTkEntry(
+            self._text_frame,
+            height=26,
+            corner_radius=10,
+            fg_color="#202025",
+            border_color="#2E2E36",
+            text_color=TEXT_PRIMARY,
+        )
+        time_entry.pack(fill="x", pady=(4, 0))
+        if self.item.due_datetime:
+            time_entry.insert(0, self.item.due_datetime.strftime("%H:%M"))
+
+        def commit() -> None:
+            title = title_entry.get().strip()
+            time_str = time_entry.get().strip()
+            self.on_update(self.item.id, title, time_str)
+            self._editing = False
+
+        def cancel() -> None:
+            # revert by reusing current values; outer will refresh UI anyway
+            self.on_update(
+                self.item.id,
+                self.item.title,
+                self.item.due_datetime.strftime("%H:%M") if self.item.due_datetime else "",
+            )
+            self._editing = False
+
+        title_entry.bind("<Return>", lambda e: commit())
+        time_entry.bind("<Return>", lambda e: commit())
+        title_entry.bind("<Escape>", lambda e: cancel())
+        time_entry.bind("<Escape>", lambda e: cancel())
+
+        title_entry.focus()
 
 
 class GlassTodoWidget(ctk.CTk):
@@ -133,6 +198,12 @@ class GlassTodoWidget(ctk.CTk):
         self.configure(fg_color=GLASS_BG)
 
         self.manager = TodoManager()
+        self._dragging_id: Optional[str] = None
+        self._drag_last_index: Optional[int] = None
+        self._drag_ghost = None
+        self._drag_offset_y = 0
+        self._drag_start_y: Optional[int] = None
+        self._drag_start_row: Optional[TodoRow] = None
 
         self._build_ui()
         self._refresh()
@@ -216,6 +287,16 @@ class GlassTodoWidget(ctk.CTk):
         )
         add_btn.pack(side="left", padx=(8, 0))
 
+        # global shortcuts
+        self.bind_all("<Return>", lambda e: self._on_add())
+        self.bind_all("<Command-d>", self._fill_current_time)
+        self.bind_all("<Command-D>", self._fill_current_time)
+
+        # global drag bindings (work with mouse or trackpad)
+        self.bind_all("<Button-1>", self._drag_handle_press)
+        self.bind_all("<B1-Motion>", self._drag_handle_motion)
+        self.bind_all("<ButtonRelease-1>", self._drag_handle_release)
+
     def _refresh(self) -> None:
         for w in self.scroll.winfo_children():
             w.destroy()
@@ -226,6 +307,7 @@ class GlassTodoWidget(ctk.CTk):
                 item,
                 on_toggle=self._on_toggle,
                 on_delete=self._on_delete,
+                on_update=self._on_update,
             )
             row.pack(fill="x")
 
@@ -265,6 +347,162 @@ class GlassTodoWidget(ctk.CTk):
     def _on_delete(self, item_id: str) -> None:
         self.manager.delete(item_id)
         self._refresh()
+
+    def _on_update(self, item_id: str, title: str, time_str: str) -> None:
+        item = self.manager.get(item_id)
+        if not item:
+            return
+
+        new_title = title.strip() or item.title
+
+        if time_str.strip():
+            due = self._parse_due(time_str)
+            if due is None:
+                return
+        else:
+            due = None
+
+        self.manager.set_title(item_id, new_title)
+        self.manager.set_due(item_id, due)
+        self._refresh()
+
+    # drag & drop reordering with ghost -----------------------------------
+    def _all_rows(self) -> list[TodoRow]:
+        """Return all TodoRow instances inside the scroll area."""
+        result: list[TodoRow] = []
+
+        def walk(widget):
+            for child in widget.winfo_children():
+                if isinstance(child, TodoRow):
+                    result.append(child)  # type: ignore[arg-type]
+                walk(child)
+
+        walk(self.scroll)
+        return result
+
+    def _drag_find_row(self, event) -> Optional[TodoRow]:
+        """Return the TodoRow under the cursor within the scroll area."""
+        widget = self.winfo_containing(event.x_root, event.y_root)
+        while widget is not None and widget is not self.scroll:
+            if isinstance(widget, TodoRow):
+                return widget  # type: ignore[return-value]
+            widget = widget.master
+        return None
+
+    def _drag_handle_press(self, event) -> None:
+        # only start drag if inside the scrollable list region
+        sx = self.scroll.winfo_rootx()
+        sy = self.scroll.winfo_rooty()
+        sw = self.scroll.winfo_width()
+        sh = self.scroll.winfo_height()
+        if not (sx <= event.x_root <= sx + sw and sy <= event.y_root <= sy + sh):
+            return
+
+        row = self._drag_find_row(event)
+        if row is None:
+            return
+        # record potential drag start; actual drag will begin on motion
+        self._drag_start_y = event.y_root
+        self._drag_start_row = row
+        self._dragging_id = None
+        self._drag_last_index = None
+        if self._drag_ghost is not None:
+            self._drag_ghost.destroy()
+            self._drag_ghost = None
+
+    def _drag_handle_motion(self, event) -> None:
+        # if we haven't started a drag yet, check movement threshold first
+        if self._dragging_id is None:
+            if self._drag_start_row is None or self._drag_start_y is None:
+                return
+            if abs(event.y_root - self._drag_start_y) < 6:
+                # small movement: treat as click, not drag
+                return
+
+            # begin drag now
+            row = self._drag_start_row
+            self._dragging_id = row.item.id
+            rows = self._all_rows()
+            try:
+                self._drag_last_index = rows.index(row)
+            except ValueError:
+                self._drag_last_index = None
+
+            # create ghost overlay at row position
+            x = row.winfo_x()
+            y = row.winfo_y()
+            w = row.winfo_width() or self.scroll.winfo_width() - 4
+            h = row.winfo_height() or 36
+
+            self._drag_offset_y = event.y_root - row.winfo_rooty()
+
+            ghost = ctk.CTkFrame(
+                self.scroll,
+                fg_color="#3A3A42",
+                corner_radius=14,
+                border_width=1,
+                border_color=ACCENT,
+                width=w,
+                height=h,
+            )
+            label = ctk.CTkLabel(
+                ghost,
+                text=row.item.title,
+                font=(FONT_FAMILY, 13, "bold"),
+                text_color=TEXT_PRIMARY,
+                anchor="w",
+            )
+            label.pack(fill="both", padx=10, pady=8)
+            ghost.place(x=x, y=y)
+            self._drag_ghost = ghost
+
+        if not self._dragging_id or not self._drag_ghost:
+            return
+
+        # move ghost with cursor
+        base_y = self.scroll.winfo_rooty()
+        new_y = event.y_root - base_y - self._drag_offset_y
+        self._drag_ghost.place_configure(y=new_y)
+
+    def _drag_handle_release(self, event) -> None:
+        # if no drag in progress, just reset and exit (it's a click)
+        if not self._dragging_id:
+            self._drag_start_y = None
+            self._drag_start_row = None
+            return
+
+        # determine new index from cursor position
+        rows = self._all_rows()
+        if rows:
+            y = event.y_root
+            new_index = len(rows) - 1
+            for idx, child in enumerate(rows):
+                cy = child.winfo_rooty()
+                ch = child.winfo_height() or 1
+                midpoint = cy + ch / 2
+                if y < midpoint:
+                    new_index = idx
+                    break
+
+            if self._drag_last_index is not None and new_index != self._drag_last_index:
+                self.manager.reorder(self._dragging_id, new_index)
+                self._refresh()
+
+        if self._drag_ghost is not None:
+            self._drag_ghost.destroy()
+            self._drag_ghost = None
+
+        self._dragging_id = None
+        self._drag_last_index = None
+        self._drag_start_y = None
+        self._drag_start_row = None
+
+    # shortcuts -----------------------------------------------------------
+    def _fill_current_time(self, event=None) -> None:
+        now = datetime.now()
+        self.due_entry.delete(0, "end")
+        self.due_entry.insert(0, now.strftime("%H:%M"))
+        self.due_entry.focus()
 
     # reminders -----------------------------------------------------------
     def _schedule_reminders(self) -> None:
