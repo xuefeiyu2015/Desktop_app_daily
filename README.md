@@ -1,6 +1,6 @@
 # Desktop_app_daily
 
-Simple Python desktop app for managing a daily to-do list with optional due times, first-priority markers, and macOS notifications.
+Simple Python desktop app for fun, for managing a daily to-do list with optional due times, first-priority markers, and macOS notifications.
 
 ## Features
 
